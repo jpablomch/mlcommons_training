@@ -66,8 +66,9 @@ def batched_nms(
     else:
         return _batched_nms_coordinate_trick(boxes, scores, idxs, iou_threshold)
 
-
-@torch.jit._script_if_tracing
+# @torch.jit.script
+# @torch.jit._script_if_tracing
+@torch.jit.script
 def _batched_nms_coordinate_trick(
     boxes: Tensor,
     scores: Tensor,
@@ -83,10 +84,11 @@ def _batched_nms_coordinate_trick(
     max_coordinate = boxes.max()
     offsets = idxs.to(boxes) * (max_coordinate + torch.tensor(1).to(boxes))
     boxes_for_nms = boxes + offsets[:, None]
-    keep = nms(boxes_for_nms, scores, iou_threshold)
+    keep = torch.ops.torchvision.nms(boxes_for_nms, scores, iou_threshold)
+    # keep = nms(boxes_for_nms, scores, iou_threshold)
     return keep
 
-
+# @torch.jit.script
 @torch.jit._script_if_tracing
 def _batched_nms_vanilla(
     boxes: Tensor,
@@ -98,10 +100,10 @@ def _batched_nms_vanilla(
     keep_mask = torch.zeros_like(scores, dtype=torch.bool)
     for class_id in torch.unique(idxs):
         curr_indices = torch.where(idxs == class_id)[0]
-        curr_keep_indices = nms(boxes[curr_indices], scores[curr_indices], iou_threshold)
-        keep_mask[curr_indices[curr_keep_indices]] = True
+        curr_keep_indices = torch.ops.torchvision.nms(torch.tensor(boxes)[torch.tensor(curr_indices)], torch.tensor(scores)[torch.tensor(curr_indices)], iou_threshold)
+        keep_mask[torch.tensor(curr_indices)[torch.tensor(curr_keep_indices)]] = True
     keep_indices = torch.where(keep_mask)[0]
-    return keep_indices[scores[keep_indices].sort(descending=True)[1]]
+    return keep_indices[torch.tensor(scores)[torch.tensor(keep_indices)].sort(descending=True)[1]]
 
 
 def clip_boxes_to_image(boxes: Tensor, size: Tuple[int, int]) -> Tensor:

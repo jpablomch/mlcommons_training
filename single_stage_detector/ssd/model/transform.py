@@ -5,8 +5,8 @@ import torchvision
 from torch import nn, Tensor
 from typing import List, Tuple, Dict, Optional
 
-from model.image_list import ImageList
-from model.roi_heads import paste_masks_in_image
+from mltraining.single_stage_detector.ssd.model.image_list import ImageList
+from mltraining.single_stage_detector.ssd.model.roi_heads import paste_masks_in_image
 
 
 @torch.jit.unused

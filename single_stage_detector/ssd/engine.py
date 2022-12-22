@@ -3,12 +3,12 @@ import sys
 import time
 import torch
 
-from ssd_logger import mllogger
+from .ssd_logger import mllogger
 from mlperf_logging.mllog.constants import (EPOCH_START, EPOCH_STOP, EVAL_START, EVAL_STOP, EVAL_ACCURACY)
 
-from coco_utils import get_coco_api_from_dataset
-from coco_eval import DefaultCocoEvaluator
-import utils
+from .coco_utils import get_coco_api_from_dataset
+from .coco_eval import DefaultCocoEvaluator
+import mltraining.single_stage_detector.ssd.utils as utils
 
 
 def train_one_epoch(model, optimizer, scaler, data_loader, device, epoch, args):
@@ -84,7 +84,11 @@ def evaluate(model, data_loader, device, epoch, args):
             torch.cuda.synchronize()
         model_time = time.time()
         with torch.cuda.amp.autocast(enabled=args.amp):
-            outputs = model(images)
+            if args.distributed:
+                images, original_image_sizes, targets_ = model.module.forward_images(images, targets)
+            else:
+                images, original_image_sizes, targets_ = model.forward_images(images)
+            outputs = model(images, original_image_sizes, targets_)
 
         outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
         model_time = time.time() - model_time

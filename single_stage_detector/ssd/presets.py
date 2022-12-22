@@ -1,4 +1,4 @@
-import transforms as T
+import mltraining.single_stage_detector.ssd.transforms as T
 
 
 class DetectionPresetTrain:

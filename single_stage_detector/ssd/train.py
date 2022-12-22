@@ -9,18 +9,18 @@ import torch
 import torch.utils.data
 import torchvision
 
-from ssd_logger import mllogger
+from .ssd_logger import mllogger
 from mlperf_logging.mllog.constants import (SUBMISSION_BENCHMARK, SUBMISSION_DIVISION, SUBMISSION_STATUS,
     SSD, CLOSED, ONPREM, EVAL_ACCURACY, STATUS, SUCCESS, ABORTED,
     INIT_START, INIT_STOP, RUN_START, RUN_STOP, SEED, GLOBAL_BATCH_SIZE, TRAIN_SAMPLES,
     EVAL_SAMPLES, EPOCH_COUNT, FIRST_EPOCH_NUM, OPT_NAME, ADAM, OPT_BASE_LR, OPT_WEIGHT_DECAY,
     OPT_LR_WARMUP_EPOCHS, OPT_LR_WARMUP_FACTOR, GRADIENT_ACCUMULATION_STEPS)
 
-import utils
-import presets
-from coco_utils import get_coco, get_openimages
-from engine import train_one_epoch, evaluate
-from model.retinanet import retinanet_from_backbone
+import mltraining.single_stage_detector.ssd.utils as utils
+import mltraining.single_stage_detector.ssd.presets as presets
+from .coco_utils import get_coco, get_openimages
+from .engine import train_one_epoch, evaluate
+# from mltraining.single_stage_detector.ssd.model.retinanet import retinanet_from_backbone
 
 
 

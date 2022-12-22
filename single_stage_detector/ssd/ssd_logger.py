@@ -1,7 +1,7 @@
 import os
 from functools import wraps
 
-import utils
+import mltraining.single_stage_detector.ssd.utils as utils
 from mlperf_logging import mllog
 
 

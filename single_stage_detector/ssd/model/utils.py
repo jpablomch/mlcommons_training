@@ -339,7 +339,7 @@ class Matcher(object):
         # Note how gt items 1, 2, 3, and 5 each have two ties
 
         pred_inds_to_update = gt_pred_pairs_of_highest_quality[1]
-        matches[pred_inds_to_update] = all_matches[pred_inds_to_update]
+        matches[torch.tensor(pred_inds_to_update)] = all_matches[torch.tensor(pred_inds_to_update)]
 
 
 class SSDMatcher(Matcher):

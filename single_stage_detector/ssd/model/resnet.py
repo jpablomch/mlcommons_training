@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.hub import load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
 
-from ssd_logger import mllogger
+from mltraining.single_stage_detector.ssd.ssd_logger import mllogger
 from mlperf_logging.mllog.constants import WEIGHTS_INITIALIZATION
 
 __all__ = ['resnet50', 'resnet101',

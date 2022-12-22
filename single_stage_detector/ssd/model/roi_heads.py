@@ -9,7 +9,7 @@ from torchvision.ops import roi_align
 
 from typing import Optional, List, Dict, Tuple
 
-from model.utils import BoxCoder, Matcher
+from mltraining.single_stage_detector.ssd.model.utils import BoxCoder, Matcher
 
 
 def expand_boxes(boxes, scale):

@@ -9,7 +9,7 @@ import torchvision
 from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 
-import transforms as T
+import mltraining.single_stage_detector.ssd.transforms as T
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):

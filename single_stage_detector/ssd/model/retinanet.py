@@ -4,19 +4,22 @@ import warnings
 
 import torch
 from torch import nn, Tensor
+from torchvision.ops import misc as misc_nn_ops
 from torch.hub import load_state_dict_from_url
 from typing import Dict, List, Tuple, Optional
 
-from model.anchor_utils import AnchorGenerator
-from model.transform import GeneralizedRCNNTransform
-from model.backbone_utils import resnet_fpn_backbone, _validate_trainable_layers
-from model.feature_pyramid_network import LastLevelP6P7
-from model.focal_loss import sigmoid_focal_loss
-from model.boxes import box_iou, clip_boxes_to_image, batched_nms
-from model.utils import Matcher, overwrite_eps, BoxCoder
+from mltraining.single_stage_detector.ssd.model.anchor_utils import AnchorGenerator
+from mltraining.single_stage_detector.ssd.model.transform import GeneralizedRCNNTransform
+from mltraining.single_stage_detector.ssd.model.backbone_utils import resnet_fpn_backbone, _validate_trainable_layers
+from mltraining.single_stage_detector.ssd.model.feature_pyramid_network import LastLevelP6P7
+from mltraining.single_stage_detector.ssd.model.focal_loss import sigmoid_focal_loss
+from mltraining.single_stage_detector.ssd.model.boxes import box_iou, clip_boxes_to_image, batched_nms
+from mltraining.single_stage_detector.ssd.model.utils import Matcher, overwrite_eps, BoxCoder
+from mltraining.single_stage_detector.ssd.model.image_list import ImageList
 
-from ssd_logger import mllogger
+from mltraining.single_stage_detector.ssd.ssd_logger import mllogger
 from mlperf_logging.mllog.constants import WEIGHTS_INITIALIZATION
+from nncf.torch.dynamic_graph.context import no_nncf_trace
 
 __all__ = [
     "retinanet_from_backbone",
@@ -44,12 +47,12 @@ class RetinaNetHead(nn.Module):
         num_classes (int): number of classes to be predicted
     """
 
-    def __init__(self, in_channels, num_anchors, num_classes):
+    def __init__(self, in_channels, num_anchors, num_classes, minimum = False):
         super().__init__()
         self.classification_head = RetinaNetClassificationHead(in_channels, num_anchors, num_classes,
-            module_name="module.head.classification_head")
+            module_name="module.head.classification_head", minimum = minimum)
         self.regression_head = RetinaNetRegressionHead(in_channels, num_anchors,
-            module_name="module.head.regression_head")
+            module_name="module.head.regression_head", minimum = minimum)
 
     def compute_loss(self, targets, head_outputs, anchors, matched_idxs):
         # type: (List[Dict[str, Tensor]], Dict[str, Tensor], List[Tensor], List[Tensor]) -> Dict[str, Tensor]
@@ -76,13 +79,21 @@ class RetinaNetClassificationHead(nn.Module):
         num_classes (int): number of classes to be predicted
     """
 
-    def __init__(self, in_channels, num_anchors, num_classes, prior_probability=0.01, module_name=""):
+    def __init__(self, in_channels, num_anchors, num_classes, prior_probability=0.01, module_name="", minimum = False):
         super().__init__()
 
         conv = []
-        for _ in range(4):
-            conv.append(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1))
+        if minimum:
+            min_channel = 128
+            conv.append(nn.Conv2d(in_channels, min_channel, kernel_size=3, stride=1, padding=1))
             conv.append(nn.ReLU())
+            for _ in range(3):
+                conv.append(nn.Conv2d(min_channel, min_channel, kernel_size=3, stride=1, padding=1))
+                conv.append(nn.ReLU())
+        else:
+            for _ in range(4):
+                conv.append(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1))
+                conv.append(nn.ReLU())
         self.conv = nn.Sequential(*conv)
 
         for name, layer in self.conv.named_children():
@@ -91,8 +102,10 @@ class RetinaNetClassificationHead(nn.Module):
                 torch.nn.init.normal_(layer.weight, std=0.01)
                 mllogger.event(key=WEIGHTS_INITIALIZATION, metadata={"tensor": f"{module_name}.conv.{name}.bias"})
                 torch.nn.init.constant_(layer.bias, 0)
-
-        self.cls_logits = nn.Conv2d(in_channels, num_anchors * num_classes, kernel_size=3, stride=1, padding=1)
+        if minimum:
+            self.cls_logits = nn.Conv2d(min_channel, num_anchors * num_classes, kernel_size=3, stride=1, padding=1)
+        else:
+            self.cls_logits = nn.Conv2d(in_channels, num_anchors * num_classes, kernel_size=3, stride=1, padding=1)
         mllogger.event(key=WEIGHTS_INITIALIZATION, metadata={"tensor": f"{module_name}.cls_logits.weight"})
         torch.nn.init.normal_(self.cls_logits.weight, std=0.01)
         mllogger.event(key=WEIGHTS_INITIALIZATION, metadata={"tensor": f"{module_name}.cls_logits.bias"})
@@ -121,7 +134,7 @@ class RetinaNetClassificationHead(nn.Module):
             gt_classes_target = torch.zeros_like(cls_logits_per_image)
             gt_classes_target[
                 foreground_idxs_per_image,
-                targets_per_image['labels'][matched_idxs_per_image[foreground_idxs_per_image]]
+                targets_per_image['labels'][torch.tensor(matched_idxs_per_image)[torch.tensor(foreground_idxs_per_image)]]
             ] = 1.0
 
             # find indices for which anchors should be ignored
@@ -167,16 +180,28 @@ class RetinaNetRegressionHead(nn.Module):
         'box_coder': BoxCoder,
     }
 
-    def __init__(self, in_channels, num_anchors, module_name=""):
+    def __init__(self, in_channels, num_anchors, module_name="", minimum = False):
         super().__init__()
 
         conv = []
-        for _ in range(4):
-            conv.append(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1))
+        if minimum:
+            min_channel = 128
+            print('activate minimum channels')
+            conv.append(nn.Conv2d(in_channels, min_channel, kernel_size=3, stride=1, padding=1))
             conv.append(nn.ReLU())
+            for _ in range(3):
+                conv.append(nn.Conv2d(min_channel, min_channel, kernel_size=3, stride=1, padding=1))
+                conv.append(nn.ReLU())
+        else:
+            for _ in range(4):
+                conv.append(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1))
+                conv.append(nn.ReLU())
         self.conv = nn.Sequential(*conv)
 
-        self.bbox_reg = nn.Conv2d(in_channels, num_anchors * 4, kernel_size=3, stride=1, padding=1)
+        if minimum:
+            self.bbox_reg = nn.Conv2d(min_channel, num_anchors * 4, kernel_size=3, stride=1, padding=1)
+        else:
+            self.bbox_reg = nn.Conv2d(in_channels, num_anchors * 4, kernel_size=3, stride=1, padding=1)
         mllogger.event(key=WEIGHTS_INITIALIZATION, metadata={"tensor": f"{module_name}.bbox_reg.weight"})
         torch.nn.init.normal_(self.bbox_reg.weight, std=0.01)
         mllogger.event(key=WEIGHTS_INITIALIZATION, metadata={"tensor": f"{module_name}.bbox_reg.bias"})
@@ -204,7 +229,7 @@ class RetinaNetRegressionHead(nn.Module):
             num_foreground = foreground_idxs_per_image.numel()
 
             # select only the foreground boxes
-            matched_gt_boxes_per_image = targets_per_image['boxes'][matched_idxs_per_image[foreground_idxs_per_image]]
+            matched_gt_boxes_per_image = targets_per_image['boxes'][torch.tensor(matched_idxs_per_image)[torch.tensor(foreground_idxs_per_image)]]
             bbox_regression_per_image = bbox_regression_per_image[foreground_idxs_per_image, :]
             anchors_per_image = anchors_per_image[foreground_idxs_per_image, :]
 
@@ -337,7 +362,8 @@ class RetinaNet(nn.Module):
                  nms_thresh=0.5,
                  detections_per_img=300,
                  fg_iou_thresh=0.5, bg_iou_thresh=0.4,
-                 topk_candidates=1000):
+                 topk_candidates=1000,
+                 minimum = False):
         super().__init__()
 
         if not hasattr(backbone, "out_channels"):
@@ -359,7 +385,8 @@ class RetinaNet(nn.Module):
         self.anchor_generator = anchor_generator
 
         if head is None:
-            head = RetinaNetHead(backbone.out_channels, anchor_generator.num_anchors_per_location()[0], num_classes)
+            head = RetinaNetHead(backbone.out_channels, len(anchor_generator.sizes[0]) * len(anchor_generator.aspect_ratios[0]), num_classes, minimum)
+            # head = RetinaNetHead(backbone.out_channels, anchor_generator.num_anchors_per_location()[0], num_classes)
         self.head = head
 
         if proposal_matcher is None:
@@ -408,6 +435,9 @@ class RetinaNet(nn.Module):
                 continue
 
             match_quality_matrix = box_iou(targets_per_image['boxes'], anchors_per_image)
+            # highest_quality_foreach_gt, _ = match_quality_matrix.max(dim=1)
+            # print(highest_quality_foreach_gt)
+            # import pdb;pdb.set_trace()
             matched_idxs.append(self.proposal_matcher(match_quality_matrix))
 
         return self.head.compute_loss(targets, head_outputs, anchors, matched_idxs)
@@ -441,15 +471,18 @@ class RetinaNet(nn.Module):
                 topk_idxs = torch.where(keep_idxs)[0]
 
                 # keep only topk scoring predictions
-                num_topk = min(self.topk_candidates, topk_idxs.size(0))
+                # num_topk = min(self.topk_candidates, topk_idxs.size(0))
+                topk_size = torch.tensor(topk_idxs.size(0))
+                num_topk = torch.where(self.topk_candidates < topk_size, self.topk_candidates, topk_size)
                 scores_per_level, idxs = scores_per_level.topk(num_topk)
-                topk_idxs = topk_idxs[idxs]
+                # scores_per_level, idxs = scores_per_level.topk(topk_idxs.size(0))
+                # if len(topk_idxs) > 0:
+                topk_idxs = topk_idxs[torch.tensor(idxs)]
 
                 anchor_idxs = torch.div(topk_idxs, num_classes, rounding_mode='floor')
                 labels_per_level = topk_idxs % num_classes
-
-                boxes_per_level = self.box_coder.decode_single(box_regression_per_level[anchor_idxs],
-                                                               anchors_per_level[anchor_idxs])
+                boxes_per_level = self.box_coder.decode_single(box_regression_per_level[torch.tensor(anchor_idxs)],
+                                                            anchors_per_level[torch.tensor(anchor_idxs)])
                 boxes_per_level = clip_boxes_to_image(boxes_per_level, image_shape)
 
                 image_boxes.append(boxes_per_level)
@@ -460,47 +493,42 @@ class RetinaNet(nn.Module):
             image_scores = torch.cat(image_scores, dim=0)
             image_labels = torch.cat(image_labels, dim=0)
 
+            # detections.append({
+            #     'boxes': image_boxes,
+            #     'scores': image_scores,
+            #     'labels': image_labels,
+            # })
+
+
             # non-maximum suppression
+            # keep = self.nms(image_boxes, image_scores, image_labels, self.nms_thresh)
             keep = batched_nms(image_boxes, image_scores, image_labels, self.nms_thresh)
             keep = keep[:self.detections_per_img]
 
             detections.append({
-                'boxes': image_boxes[keep],
-                'scores': image_scores[keep],
-                'labels': image_labels[keep],
+                'boxes': image_boxes[torch.tensor(keep)],
+                'scores': image_scores[torch.tensor(keep)],
+                'labels': image_labels[torch.tensor(keep)],
             })
 
         return detections
 
-    def forward(self, images, targets=None):
-        # type: (List[Tensor], Optional[List[Dict[str, Tensor]]]) -> Tuple[Dict[str, Tensor], List[Dict[str, Tensor]]]
-        """
-        Args:
-            images (list[Tensor]): images to be processed
-            targets (list[Dict[Tensor]]): ground-truth boxes present in the image (optional)
-
-        Returns:
-            result (list[BoxList] or dict[Tensor]): the output from the model.
-                During training, it returns a dict[Tensor] which contains the losses.
-                During testing, it returns list[BoxList] contains additional fields
-                like `scores`, `labels` and `mask` (for Mask R-CNN models).
-
-        """
-        if self.training and targets is None:
-            raise ValueError("In training mode, targets should be passed")
+    def forward_images(self, images, targets=None):
+        # if self.training and targets is None:
+        #     raise ValueError("In training mode, targets should be passed")
 
         if self.training:
-            assert targets is not None
-            for target in targets:
-                boxes = target["boxes"]
-                if isinstance(boxes, torch.Tensor):
-                    if len(boxes.shape) != 2 or boxes.shape[-1] != 4:
-                        raise ValueError("Expected target boxes to be a tensor"
-                                         "of shape [N, 4], got {:}.".format(
-                                             boxes.shape))
-                else:
-                    raise ValueError("Expected target boxes to be of type "
-                                     "Tensor, got {:}.".format(type(boxes)))
+            if targets is not None:
+                for target in targets:
+                    boxes = target["boxes"]
+                    if isinstance(boxes, torch.Tensor):
+                        if len(boxes.shape) != 2 or boxes.shape[-1] != 4:
+                            raise ValueError("Expected target boxes to be a tensor"
+                                            "of shape [N, 4], got {:}.".format(
+                                                boxes.shape))
+                    else:
+                        raise ValueError("Expected target boxes to be of type "
+                                        "Tensor, got {:}.".format(type(boxes)))
 
         # get the original image sizes
         original_image_sizes: List[Tuple[int, int]] = []
@@ -514,20 +542,132 @@ class RetinaNet(nn.Module):
 
         # Check for degenerate boxes
         # TODO: Move this to a function
-        if targets is not None:
-            for target_idx, target in enumerate(targets):
-                boxes = target["boxes"]
-                degenerate_boxes = boxes[:, 2:] <= boxes[:, :2]
-                if degenerate_boxes.any():
-                    # print the first degenerate box
-                    bb_idx = torch.where(degenerate_boxes.any(dim=1))[0][0]
-                    degen_bb: List[float] = boxes[bb_idx].tolist()
-                    raise ValueError("All bounding boxes should have positive height and width."
-                                     " Found invalid box {} for target at index {}."
-                                     .format(degen_bb, target_idx))
+        if self.training:
+            if targets is not None:
+                for target_idx, target in enumerate(targets):
+                    boxes = target["boxes"]
+                    degenerate_boxes = boxes[:, 2:] <= boxes[:, :2]
+                    if degenerate_boxes.any():
+                        # print the first degenerate box
+                        bb_idx = torch.where(degenerate_boxes.any(dim=1))[0][0]
+                        degen_bb: List[float] = boxes[bb_idx].tolist()
+                        raise ValueError("All bounding boxes should have positive height and width."
+                                        " Found invalid box {} for target at index {}."
+                                        .format(degen_bb, target_idx))
 
         if self.data_layout == 'channels_last':
             images.tensors = images.tensors.to(memory_format=torch.channels_last)
+        return images, original_image_sizes, targets
+
+    def forward(self, images, original_image_sizes=None, targets=None, export_to_onnx=False):
+        """
+        Args:
+            images (list[Tensor]): images to be processed ###original_image_sizes=None,
+            targets (list[Dict[Tensor]]): ground-truth boxes present in the image (optional)
+
+        Returns:
+            result (list[BoxList] or dict[Tensor]): the output from the model.
+                During training, it returns a dict[Tensor] which contains the losses.
+                During testing, it returns list[BoxList] contains additional fields
+                like `scores`, `labels` and `mask` (for Mask R-CNN models).
+
+        """
+        if export_to_onnx:
+            print('exporting to onnx...')
+            if self.training and targets is None:
+                raise ValueError("In training mode, targets should be passed")
+
+            if self.training:
+                assert targets is not None
+                for target in targets:
+                    boxes = target["boxes"]
+                    if isinstance(boxes, torch.Tensor):
+                        if len(boxes.shape) != 2 or boxes.shape[-1] != 4:
+                            raise ValueError("Expected target boxes to be a tensor"
+                                            "of shape [N, 4], got {:}.".format(
+                                                boxes.shape))
+                    else:
+                        raise ValueError("Expected target boxes to be of type "
+                                        "Tensor, got {:}.".format(type(boxes)))
+
+            # get the original image sizes
+            original_image_sizes: List[Tuple[int, int]] = []
+            for img in images:
+                val = img.shape[-2:]
+                assert len(val) == 2
+                original_image_sizes.append((val[0], val[1]))
+
+            # transform the input
+            if targets is not None:
+                # make a copy of targets to avoid modifying it in-place
+                # once torchscript supports dict comprehension
+                # this can be simplified as follows
+                # targets = [{k: v for k,v in t.items()} for t in targets]
+                targets_copy: List[Dict[str, Tensor]] = []
+                for t in targets:
+                    data: Dict[str, Tensor] = {}
+                    for k, v in t.items():
+                        data[k] = v
+                    targets_copy.append(data)
+                targets = targets_copy
+            for i in range(len(images)):
+                image = images[i]
+                target_index = targets[i] if targets is not None else None
+
+                if image.dim() != 3:
+                    raise ValueError("images is expected to be a list of 3d tensors "
+                                    "of shape [C, H, W], got {}".format(image.shape))
+                image = self.transform.normalize(image)
+                image, target_index = self.transform.resize(image, target_index)
+                images[i] = image
+                if targets is not None and target_index is not None:
+                    targets[i] = target_index
+
+            image_sizes = [img.shape[-2:] for img in images]
+            try:
+                images = torch.stack(images)
+            except:
+                print('--------------stack failed') # failed for traced tensor
+            image_sizes_list: List[Tuple[int, int]] = []
+            for image_size in image_sizes:
+                assert len(image_size) == 2
+                image_sizes_list.append((image_size[0], image_size[1]))
+
+            images = ImageList(images, image_sizes_list)
+
+            # Check for degenerate boxes
+            # TODO: Move this to a function
+            if targets is not None:
+                for target_idx, target in enumerate(targets):
+                    boxes = target["boxes"]
+                    degenerate_boxes = boxes[:, 2:] <= boxes[:, :2]
+                    if degenerate_boxes.any():
+                        # print the first degenerate box
+                        bb_idx = torch.where(degenerate_boxes.any(dim=1))[0][0]
+                        degen_bb: List[float] = boxes[bb_idx].tolist()
+                        raise ValueError("All bounding boxes should have positive height and width."
+                                        " Found invalid box {} for target at index {}."
+                                        .format(degen_bb, target_idx))
+
+            # if self.data_layout == 'channels_last':
+            #     try:
+            #         images.tensors = images.tensors.to(memory_format=torch.channels_last)
+            #     except:
+            #         print('--------------channels last failed')
+        elif original_image_sizes is None:
+            # for create_nncf_network
+            # get the original image sizes
+            original_image_sizes: List[Tuple[int, int]] = []
+            for ii in range(len(images)):
+                img = images[ii]
+                val = img.shape[-2:]
+                assert len(val) == 2
+                original_image_sizes.append((val[0], val[1]))
+
+                img = self.transform.normalize(img)
+                images[ii] = img
+
+            images = ImageList(images, original_image_sizes)
 
         # get the features from the backbone
         features = self.backbone(images.tensors)
@@ -541,34 +681,29 @@ class RetinaNet(nn.Module):
         head_outputs = self.head(features)
 
         # create the set of anchors
-        anchors = self.anchor_generator(images, features)
+        with no_nncf_trace():
+            anchors = self.anchor_generator(images, features)
 
         losses = {}
         detections: List[Dict[str, Tensor]] = []
         if self.training:
-            assert targets is not None
-
+            return targets, head_outputs, anchors
             # compute the losses
-            losses = self.compute_loss(targets, head_outputs, anchors)
+            # losses = self.compute_loss(targets, head_outputs, anchors)
         else:
-            # recover level sizes
-            num_anchors_per_level = [x.size(2) * x.size(3) for x in features]
-            HW = 0
-            for v in num_anchors_per_level:
-                HW += v
-            HWA = head_outputs['cls_logits'].size(1)
-            A = HWA // HW
-            num_anchors_per_level = [hw * A for hw in num_anchors_per_level]
+            with no_nncf_trace():
+                # recover level sizes
+                num_anchors_per_level = [22500, 5625, 1521, 441] # ugly way
+                # split outputs per level
+                split_head_outputs: Dict[str, List[Tensor]] = {}
+                for k in head_outputs:
+                    split_head_outputs[k] = list(head_outputs[k].split(num_anchors_per_level, dim=1))
+                split_anchors = [list(a.split(num_anchors_per_level)) for a in anchors]
 
-            # split outputs per level
-            split_head_outputs: Dict[str, List[Tensor]] = {}
-            for k in head_outputs:
-                split_head_outputs[k] = list(head_outputs[k].split(num_anchors_per_level, dim=1))
-            split_anchors = [list(a.split(num_anchors_per_level)) for a in anchors]
-
-            # compute the detections
-            detections = self.postprocess_detections(split_head_outputs, split_anchors, images.image_sizes)
-            detections = self.transform.postprocess(detections, images.image_sizes, original_image_sizes)
+                # compute the detections
+                detections = self.postprocess_detections(split_head_outputs, split_anchors, images.image_sizes)
+                detections = self.transform.postprocess(detections, images.image_sizes, original_image_sizes)
+            return detections
 
         if torch.jit.is_scripting():
             if not self._has_warned:
@@ -586,7 +721,7 @@ model_urls = {
 
 def retinanet_resnet50_fpn(num_classes, image_size, data_layout='channels_first',
                            pretrained=False, progress=True, pretrained_backbone=True,
-                           trainable_backbone_layers=None):
+                           trainable_backbone_layers=None, norm_layer=misc_nn_ops.FrozenBatchNorm2d):
     """
     Constructs a RetinaNet model with a ResNet-50-FPN backbone.
 
@@ -644,7 +779,7 @@ def retinanet_resnet50_fpn(num_classes, image_size, data_layout='channels_first'
     # skip P2 because it generates too many anchors (according to their paper)
     backbone = resnet_fpn_backbone('resnet50', pretrained_backbone, returned_layers=[2, 3, 4],
                                    extra_blocks=LastLevelP6P7(256, 256, module_name="module.backbone.fpn.extra_blocks"),
-                                   trainable_layers=trainable_backbone_layers)
+                                   trainable_layers=trainable_backbone_layers, norm_layer=norm_layer)
     model = RetinaNet(backbone=backbone, num_classes=num_classes, data_layout=data_layout, image_size=image_size)
     if pretrained:
         state_dict = load_state_dict_from_url(model_urls['retinanet_resnet50_fpn_coco'],
@@ -656,7 +791,8 @@ def retinanet_resnet50_fpn(num_classes, image_size, data_layout='channels_first'
 
 def retinanet_resnext50_32x4d_fpn(num_classes, image_size, data_layout='channels_first',
                                   pretrained=False, progress=True, pretrained_backbone=True,
-                                  trainable_backbone_layers=None):
+                                  trainable_backbone_layers=None, norm_layer=misc_nn_ops.FrozenBatchNorm2d,
+                                  return_layers = [2, 3, 4], minimum = False):
     """
     Constructs a RetinaNet model with a resnext50_32x4d-FPN backbone.
 
@@ -712,10 +848,10 @@ def retinanet_resnext50_32x4d_fpn(num_classes, image_size, data_layout='channels
         # no need to download the backbone if pretrained is set
         pretrained_backbone = False
     # skip P2 because it generates too many anchors (according to their paper)
-    backbone = resnet_fpn_backbone('resnext50_32x4d', pretrained_backbone, returned_layers=[2, 3, 4],
+    backbone = resnet_fpn_backbone('resnext50_32x4d', pretrained_backbone, returned_layers=return_layers,
                                    extra_blocks=LastLevelP6P7(256, 256, module_name="module.backbone.fpn.extra_blocks"),
-                                   trainable_layers=trainable_backbone_layers)
-    model = RetinaNet(backbone=backbone, num_classes=num_classes, data_layout=data_layout, image_size=image_size)
+                                   trainable_layers=trainable_backbone_layers, norm_layer=norm_layer)
+    model = RetinaNet(backbone=backbone, num_classes=num_classes, data_layout=data_layout, image_size=image_size, minimum = minimum)
     if pretrained:
         raise ValueError("Torchvision doesn't have a pretrained retinanet_resnext50_32x4d_fpn model")
 
@@ -724,7 +860,7 @@ def retinanet_resnext50_32x4d_fpn(num_classes, image_size, data_layout='channels
 
 def retinanet_resnet101_fpn(num_classes, image_size, data_layout='channels_first',
                             pretrained=False, progress=True, pretrained_backbone=True,
-                            trainable_backbone_layers=None):
+                            trainable_backbone_layers=None, norm_layer=misc_nn_ops.FrozenBatchNorm2d):
     """
     Constructs a RetinaNet model with a ResNet-101-FPN backbone.
 
@@ -782,7 +918,7 @@ def retinanet_resnet101_fpn(num_classes, image_size, data_layout='channels_first
     # skip P2 because it generates too many anchors (according to their paper)
     backbone = resnet_fpn_backbone('resnet101', pretrained_backbone, returned_layers=[2, 3, 4],
                                    extra_blocks=LastLevelP6P7(256, 256, module_name="module.backbone.fpn.extra_blocks"),
-                                   trainable_layers=trainable_backbone_layers)
+                                   trainable_layers=trainable_backbone_layers, norm_layer=norm_layer)
     model = RetinaNet(backbone=backbone, num_classes=num_classes, data_layout=data_layout, image_size=image_size)
     if pretrained:
         raise ValueError("Torchvision doesn't have a pretrained retinanet_resnet101_fpn model")
@@ -792,7 +928,7 @@ def retinanet_resnet101_fpn(num_classes, image_size, data_layout='channels_first
 
 def retinanet_resnext101_32x8d_fpn(num_classes, image_size, data_layout='channels_first',
                                    pretrained=False, progress=True, pretrained_backbone=True,
-                                   trainable_backbone_layers=None):
+                                   trainable_backbone_layers=None, norm_layer=misc_nn_ops.FrozenBatchNorm2d):
     """
     Constructs a RetinaNet model with a resnext101_32x8d-FPN backbone.
 
@@ -850,7 +986,8 @@ def retinanet_resnext101_32x8d_fpn(num_classes, image_size, data_layout='channel
     # skip P2 because it generates too many anchors (according to their paper)
     backbone = resnet_fpn_backbone('resnext101_32x8d', pretrained_backbone, returned_layers=[2, 3, 4],
                                    extra_blocks=LastLevelP6P7(256, 256, module_name="module.backbone.fpn.extra_blocks"),
-                                   trainable_layers=trainable_backbone_layers)
+                                   trainable_layers=trainable_backbone_layers,
+                                   norm_layer=norm_layer)
     model = RetinaNet(backbone=backbone, num_classes=num_classes, data_layout=data_layout, image_size=image_size)
     if pretrained:
         raise ValueError("Torchvision doesn't have a pretrained retinanet_resnext101_32x8d_fpn model")
@@ -861,7 +998,8 @@ def retinanet_resnext101_32x8d_fpn(num_classes, image_size, data_layout='channel
 def retinanet_from_backbone(backbone,
                             num_classes=91, data_layout='channels_first', image_size=None,
                             pretrained=False, progress=True, pretrained_backbone=True,
-                            trainable_backbone_layers=None):
+                            trainable_backbone_layers=None, norm_layer=misc_nn_ops.FrozenBatchNorm2d,
+                            return_layers = [2, 3, 4], minimum = False):
     if image_size is None:
         image_size = [800, 800]
 
@@ -869,21 +1007,27 @@ def retinanet_from_backbone(backbone,
         return retinanet_resnet50_fpn(num_classes=num_classes, data_layout=data_layout, image_size=image_size,
                                       pretrained=pretrained, progress=progress,
                                       pretrained_backbone=pretrained_backbone,
-                                      trainable_backbone_layers=trainable_backbone_layers)
+                                      trainable_backbone_layers=trainable_backbone_layers,
+                                      norm_layer=norm_layer)
     elif backbone == "resnext50_32x4d":
         return retinanet_resnext50_32x4d_fpn(num_classes=num_classes, data_layout=data_layout, image_size=image_size,
                                              pretrained=pretrained, progress=progress,
                                              pretrained_backbone=pretrained_backbone,
-                                             trainable_backbone_layers=trainable_backbone_layers)
+                                             trainable_backbone_layers=trainable_backbone_layers,
+                                             norm_layer=norm_layer,
+                                             return_layers=return_layers,
+                                             minimum = minimum)
     elif backbone == "resnet101":
         return retinanet_resnet101_fpn(num_classes=num_classes, data_layout=data_layout, image_size=image_size,
                                        pretrained=pretrained, progress=progress,
                                        pretrained_backbone=pretrained_backbone,
-                                       trainable_backbone_layers=trainable_backbone_layers)
+                                       trainable_backbone_layers=trainable_backbone_layers,
+                                       norm_layer=norm_layer)
     elif backbone == "resnext101_32x8d":
         return retinanet_resnext101_32x8d_fpn(num_classes=num_classes, data_layout=data_layout, image_size=image_size,
                                               pretrained=pretrained, progress=progress,
                                               pretrained_backbone=pretrained_backbone,
-                                              trainable_backbone_layers=trainable_backbone_layers)
+                                              trainable_backbone_layers=trainable_backbone_layers,
+                                              norm_layer=norm_layer)
     else:
         raise ValueError(f"Unknown backbone {backbone}")

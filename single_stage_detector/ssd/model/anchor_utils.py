@@ -1,9 +1,11 @@
 import math
+from typing import Any
 import torch
 from torch import nn, Tensor
 
 from typing import List, Optional
-from model.image_list import ImageList
+from nncf.torch.utils import add_domain
+from mltraining.single_stage_detector.ssd.model.image_list import ImageList
 
 
 class AnchorGenerator(nn.Module):
@@ -48,40 +50,41 @@ class AnchorGenerator(nn.Module):
 
         self.sizes = sizes
         self.aspect_ratios = aspect_ratios
-        self.cell_anchors = [self.generate_anchors(size, aspect_ratio)
-                             for size, aspect_ratio in zip(sizes, aspect_ratios)]
 
-    # TODO: https://github.com/pytorch/pytorch/issues/26792
-    # For every (aspect_ratios, scales) combination, output a zero-centered anchor with those values.
-    # (scales, aspect_ratios) are usually an element of zip(self.scales, self.aspect_ratios)
-    # This method assumes aspect ratio = height / width for an anchor.
-    def generate_anchors(self, scales: List[int], aspect_ratios: List[float], dtype: torch.dtype = torch.float32,
-                         device: torch.device = torch.device("cpu")):
-        scales = torch.as_tensor(scales, dtype=dtype, device=device)
-        aspect_ratios = torch.as_tensor(aspect_ratios, dtype=dtype, device=device)
-        h_ratios = torch.sqrt(aspect_ratios)
-        w_ratios = 1 / h_ratios
+    def forward(self, image_list: ImageList, feature_maps: List[Tensor]) -> List[Tensor]:
+        return NNCFAnchor.apply(image_list, feature_maps, self)
 
-        ws = (w_ratios[:, None] * scales[None, :]).view(-1)
-        hs = (h_ratios[:, None] * scales[None, :]).view(-1)
 
-        base_anchors = torch.stack([-ws, -hs, ws, hs], dim=1) / 2
-        return base_anchors.round()
+class NNCFAnchor(torch.autograd.Function):
+    @staticmethod
+    def symbolic(g, image_list: ImageList, feature_maps: List[Tensor], anchor_params:AnchorGenerator) -> List[Tensor]:
+        return g.op(add_domain("AnchorGenerator"), image_list, feature_maps, sizes_i=anchor_params.sizes,
+            aspect_ratios_i=anchor_params.aspect_ratios)
 
-    def set_cell_anchors(self, dtype: torch.dtype, device: torch.device):
-        self.cell_anchors = [cell_anchor.to(dtype=dtype, device=device)
-                             for cell_anchor in self.cell_anchors]
+    @staticmethod
+    def forward(ctx, image_list: ImageList, feature_maps: List[Tensor], anchor_params:AnchorGenerator) -> List[Tensor]:
+        cell_anchors = []
+        for scales, aspect_ratio in zip(anchor_params.sizes, anchor_params.aspect_ratios):
+            scales = torch.as_tensor(scales, dtype=torch.float32, device=torch.device("cpu"))
+            aspect_ratio = torch.as_tensor(aspect_ratio, dtype=torch.float32, device=torch.device("cpu"))
+            h_ratios = torch.sqrt(aspect_ratio)
+            w_ratios = 1 / h_ratios
 
-    def num_anchors_per_location(self):
-        return [len(s) * len(a) for s, a in zip(self.sizes, self.aspect_ratios)]
+            ws = (w_ratios[:, None] * scales[None, :]).view(-1)
+            hs = (h_ratios[:, None] * scales[None, :]).view(-1)
 
-    # For every combination of (a, (g, s), i) in (self.cell_anchors, zip(grid_sizes, strides), 0:2),
-    # output g[i] anchors that are s[i] distance apart in direction i, with the same dimensions as a.
-    def grid_anchors(self, grid_sizes: List[List[int]], strides: List[List[Tensor]]) -> List[Tensor]:
-        anchors = []
-        cell_anchors = self.cell_anchors
-        assert cell_anchors is not None
+            cell_anchors.append((torch.stack([-ws, -hs, ws, hs], dim=1) / 2).round())
 
+        grid_sizes = [feature_map.shape[-2:] for feature_map in feature_maps]
+        image_size = image_list.tensors.shape[-2:]
+        dtype, device = feature_maps[0].dtype, feature_maps[0].device
+        strides = [[torch.tensor(image_size[0] // g[0], dtype=torch.int64, device=device),
+                    torch.tensor(image_size[1] // g[1], dtype=torch.int64, device=device)] for g in grid_sizes]
+
+        cell_anchors = [cell_anchor.to(dtype=dtype, device=device) for cell_anchor in cell_anchors]
+        cell_anchors = cell_anchors[-len(grid_sizes):]
+
+        anchors_over_all_feature_maps = []
         if not (len(grid_sizes) == len(strides) == len(cell_anchors)):
             raise ValueError("Anchors should be Tuple[Tuple[int]] because each feature "
                              "map could potentially have different sizes and aspect ratios. "
@@ -109,23 +112,17 @@ class AnchorGenerator(nn.Module):
 
             # For every (base anchor, output anchor) pair,
             # offset each zero-centered base anchor by the center of the output anchor.
-            anchors.append(
+            anchors_over_all_feature_maps.append(
                 (shifts.view(-1, 1, 4) + base_anchors.view(1, -1, 4)).reshape(-1, 4)
             )
 
-        return anchors
-
-    def forward(self, image_list: ImageList, feature_maps: List[Tensor]) -> List[Tensor]:
-        grid_sizes = [feature_map.shape[-2:] for feature_map in feature_maps]
-        image_size = image_list.tensors.shape[-2:]
-        dtype, device = feature_maps[0].dtype, feature_maps[0].device
-        strides = [[torch.tensor(image_size[0] // g[0], dtype=torch.int64, device=device),
-                    torch.tensor(image_size[1] // g[1], dtype=torch.int64, device=device)] for g in grid_sizes]
-        self.set_cell_anchors(dtype, device)
-        anchors_over_all_feature_maps = self.grid_anchors(grid_sizes, strides)
         anchors: List[List[torch.Tensor]] = []
         for _ in range(len(image_list.image_sizes)):
             anchors_in_image = [anchors_per_feature_map for anchors_per_feature_map in anchors_over_all_feature_maps]
             anchors.append(anchors_in_image)
         anchors = [torch.cat(anchors_per_image) for anchors_per_image in anchors]
         return anchors
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        return grad_outputs[1]

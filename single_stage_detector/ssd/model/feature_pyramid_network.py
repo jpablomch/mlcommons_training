@@ -5,7 +5,7 @@ from torch import nn, Tensor
 
 from typing import Tuple, List, Dict, Optional
 
-from ssd_logger import mllogger
+from mltraining.single_stage_detector.ssd.ssd_logger import mllogger
 from mlperf_logging.mllog.constants import WEIGHTS_INITIALIZATION
 
 

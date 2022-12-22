@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+eps = 1e-8
 
 def sigmoid_focal_loss(
     inputs: torch.Tensor,
@@ -30,9 +31,10 @@ def sigmoid_focal_loss(
     Returns:
         Loss tensor with the reduction option applied.
     """
-    p = torch.sigmoid(inputs)
+    # p = torch.sigmoid(inputs)
+    p = torch.clamp(torch.sigmoid(inputs).type(torch.float32), min=eps, max=1-eps).type(torch.float32)
     ce_loss = F.binary_cross_entropy_with_logits(
-        inputs, targets, reduction="none"
+        inputs.type(torch.float32), targets.type(torch.float32), reduction="none"
     )
     p_t = p * targets + (1 - p) * (1 - targets)
     loss = ce_loss * ((1 - p_t) ** gamma)

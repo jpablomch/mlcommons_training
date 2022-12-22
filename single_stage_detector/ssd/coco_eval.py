@@ -14,7 +14,7 @@ import pycocotools.mask as mask_util
 
 from collections import defaultdict
 
-import utils
+import mltraining.single_stage_detector.ssd.utils as utils
 
 
 class CocoEvaluator(object):

@@ -3,9 +3,9 @@ from torch import nn
 
 from torchvision.ops import misc as misc_nn_ops
 
-import model.resnet
-from model.utils import IntermediateLayerGetter
-from model.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool
+from mltraining.single_stage_detector.ssd.model import resnet
+from mltraining.single_stage_detector.ssd.model.utils import IntermediateLayerGetter
+from mltraining.single_stage_detector.ssd.model.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool
 
 
 class BackboneWithFPN(nn.Module):
@@ -90,7 +90,7 @@ def resnet_fpn_backbone(
             a new list of feature maps and their corresponding names. By
             default a ``LastLevelMaxPool`` is used.
     """
-    backbone = model.resnet.__dict__[backbone_name](pretrained=pretrained, norm_layer=norm_layer)
+    backbone = resnet.__dict__[backbone_name](pretrained=pretrained, norm_layer=norm_layer)
 
     # select layers that wont be frozen
     assert 0 <= trainable_layers <= 5
